@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Station météo BLE</title>
+<style>
+  body { font-family: sans-serif; background:#10141c; color:#e8ecf2;
+         margin:0; padding:16px; text-align:center; }
+  h1 { font-weight:500; font-size:1.3em; }
+  button { background:#3b82f6; color:white; border:none; border-radius:12px;
+           font-size:1.1em; padding:14px 28px; margin:8px; }
+  button:disabled { background:#2a3342; color:#8a96a8; }
+  .carte { background:#1c2330; border-radius:16px; padding:16px;
+           margin:14px auto; max-width:480px; }
+  .label { color:#8a96a8; font-size:0.95em; }
+  .valeur { font-size:2.4em; margin:4px 0 10px; }
+  canvas { width:100%; height:140px; display:block; }
+  #etat { color:#8a96a8; font-size:0.9em; margin-top:8px; }
+</style>
+</head>
+<body>
+  <h1>Station météo BLE</h1>
+
+  <button id="btnConnexion">Se connecter</button>
+  <button id="btnDeconnexion" disabled>Se déconnecter</button>
+  <div id="etat">Non connecté</div>
+
+  <div class="carte">
+    <div class="label">Température</div>
+    <div class="valeur" id="t">--</div>
+    <canvas id="gt"></canvas>
+  </div>
+
+  <div class="carte">
+    <div class="label">Pression</div>
+    <div class="valeur" id="p">--</div>
+    <canvas id="gp"></canvas>
+  </div>
+
+<script>
+// ---------- UUID standard du Bluetooth SIG (les mêmes que sur l'ESP32) ----------
+const SERVICE_ENV   = 0x181A;   // Environmental Sensing
+const CAR_TEMP      = 0x2A6E;   // Temperature
+const CAR_PRESSION  = 0x2A6D;   // Pressure
+
+const MAX_POINTS = 150;         // 150 x 2 s = 5 minutes d'historique
+
+let appareil = null;            // l'ESP32 choisi par l'utilisateur
+const histoT = [];
+const histoP = [];
+
+const $ = id => document.getElementById(id);
+
+function afficherEtat(texte) { $('etat').textContent = texte; }
+
+// ---------- Décodage des octets reçus ----------
+// "true" = little-endian : octet de poids faible en premier, comme l'impose la norme BLE
+function decoderTemperature(dataView) {
+  return dataView.getInt16(0, true) / 100;         // centièmes de °C -> °C
+}
+function decoderPression(dataView) {
+  return dataView.getUint32(0, true) / 10 / 100;   // dixièmes de Pa -> Pa -> hPa
+}
+
+function ajouter(tableau, valeur) {
+  tableau.push(valeur);
+  if (tableau.length > MAX_POINTS) tableau.shift();  // on retire la plus ancienne
+}
+
+function nouvelleTemperature(event) {
+  const t = decoderTemperature(event.target.value);
+  $('t').textContent = t.toFixed(1) + ' °C';
+  ajouter(histoT, t);
+  tracer('gt', histoT, '#ff8a5c');
+  afficherEtat('Connecté à ' + appareil.name + ' — ' +
+               new Date().toLocaleTimeString('fr-FR'));
+}
+
+function nouvellePression(event) {
+  const p = decoderPression(event.target.value);
+  $('p').textContent = p.toFixed(1) + ' hPa';
+  ajouter(histoP, p);
+  tracer('gp', histoP, '#5cb8ff');
+}
+
+// ---------- Connexion ----------
+async function connecter() {
+  if (!navigator.bluetooth) {
+    afficherEtat('Web Bluetooth non disponible : utilise Chrome, en https.');
+    return;
+  }
+  try {
+    afficherEtat('Recherche...');
+    // 1) Chrome affiche la liste des appareils qui annoncent le service 0x181A
+    appareil = await navigator.bluetooth.requestDevice({
+      filters: [{ services: [SERVICE_ENV] }]
+    });
+    appareil.addEventListener('gattserverdisconnected', surDeconnexion);
+
+    // 2) Connexion au serveur GATT de l'ESP32
+    afficherEtat('Connexion à ' + appareil.name + '...');
+    const serveur = await appareil.gatt.connect();
+
+    // 3) On descend dans l'arborescence : service -> caractéristiques
+    const service = await serveur.getPrimaryService(SERVICE_ENV);
+    const carT = await service.getCharacteristic(CAR_TEMP);
+    const carP = await service.getCharacteristic(CAR_PRESSION);
+
+    // 4) Première lecture (READ)
+    nouvelleTemperature({ target: { value: await carT.readValue() } });
+    nouvellePression({ target: { value: await carP.readValue() } });
+
+    // 5) Abonnement aux notifications (NOTIFY)
+    carT.addEventListener('characteristicvaluechanged', nouvelleTemperature);
+    carP.addEventListener('characteristicvaluechanged', nouvellePression);
+    await carT.startNotifications();
+    await carP.startNotifications();
+
+    $('btnConnexion').disabled = true;
+    $('btnDeconnexion').disabled = false;
+  } catch (erreur) {
+    afficherEtat('Erreur : ' + erreur.message);
+  }
+}
+
+function deconnecter() {
+  if (appareil && appareil.gatt.connected) appareil.gatt.disconnect();
+}
+
+function surDeconnexion() {
+  afficherEtat('Déconnecté');
+  $('btnConnexion').disabled = false;
+  $('btnDeconnexion').disabled = true;
+}
+
+$('btnConnexion').addEventListener('click', connecter);
+$('btnDeconnexion').addEventListener('click', deconnecter);
+
+// ---------- Tracé d'une courbe (même principe qu'à l'étape 3) ----------
+function tracer(id, valeurs, couleur) {
+  const c = $(id);
+  const dpr = window.devicePixelRatio || 1;
+  const w = c.clientWidth, h = c.clientHeight;
+  c.width = w * dpr; c.height = h * dpr;
+  const ctx = c.getContext('2d');
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, w, h);
+  ctx.font = '11px sans-serif';
+  ctx.fillStyle = '#8a96a8';
+  if (valeurs.length < 2) return;
+
+  let min = Math.min(...valeurs), max = Math.max(...valeurs);
+  if (max - min < 0.5) { const m = (max + min) / 2; min = m - 0.25; max = m + 0.25; }
+
+  const gauche = 44, bas = 18, haut = 8;
+  const x = i => gauche + i * (w - gauche - 4) / (MAX_POINTS - 1);
+  const y = v => haut + (h - haut - bas) * (1 - (v - min) / (max - min));
+
+  ctx.strokeStyle = '#2a3342'; ctx.lineWidth = 1;
+  for (let k = 0; k <= 2; k++) {
+    const v = min + (max - min) * k / 2;
+    ctx.beginPath(); ctx.moveTo(gauche, y(v)); ctx.lineTo(w, y(v)); ctx.stroke();
+    ctx.fillText(v.toFixed(1), 2, y(v) + 4);
+  }
+
+  ctx.strokeStyle = couleur; ctx.lineWidth = 2;
+  ctx.beginPath();
+  valeurs.forEach((v, i) => i ? ctx.lineTo(x(i), y(v)) : ctx.moveTo(x(i), y(v)));
+  ctx.stroke();
+
+  ctx.fillText('5 dernières minutes', gauche, h - 3);
+}
+</script>
+</body>
+</html>
